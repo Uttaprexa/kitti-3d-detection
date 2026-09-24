@@ -5,6 +5,35 @@ data ingestion (LiDAR + camera calibration), coordinate transforms between
 sensor frames, model, training, and evaluation with standard 3D detection
 metrics (3D IoU, mAP by distance threshold).
 
+## Results (trained on real KITTI data)
+
+Trained on a 1000-scene subset of the real KITTI training set (850 train /
+150 held-out val), on an AWS EC2 `g4dn.xlarge` (Tesla T4 GPU), resuming
+training across sessions via a checkpoint format that saves optimizer state
+alongside model weights.
+
+| Metric | Epoch 20 | Epoch 80 | Change |
+|---|---|---|---|
+| Regression loss (box-fitting error) | 0.242 | 0.061 | -75% |
+| Near-field AP, 0-30m (loose IoU>=0.1) | 0.023 | **0.266** | ~11x |
+| Mid-range AP, 30-50m (loose IoU>=0.1) | 0.015 | 0.053 | ~3.5x |
+| Far-field AP, 50m+ (loose IoU>=0.1) | 0.003 | 0.009 | ~3x |
+
+At the standard strict benchmark bar (score>=0.3 confidence, 3D IoU>=0.5),
+AP is still ~0 at epoch 80 -- the model has learned real signal (it's
+finding roughly the right locations, especially for near-field objects
+where LiDAR point density is highest) but isn't yet precise/confident
+enough to clear KITTI's actual pass/fail threshold. `reg_loss` was still
+dropping steadily with no plateau at epoch 80, so this reads as an
+undertrained-but-improving model rather than a broken one -- consistent
+with training a small model on 850 scenes (vs. KITTI's full ~7481-scene
+training set) for a comparatively small number of epochs.
+
+Measured training throughput on this setup: **~7.5 minutes/epoch** on 850
+scenes. That rate is dominated by anchor-to-groundtruth matching, which is
+pure numpy/CPU regardless of GPU (see the bug-fix log below) -- the actual
+GPU forward/backward pass is not the bottleneck here.
+
 ## What's here
 
 ```
@@ -20,9 +49,9 @@ model/
   pointpillars.py            PillarFeatureNet + 2D CNN backbone + detection head
 eval/
   metrics.py                 3D-IoU matching, AP, mAP broken down by distance
-train.py                     Training loop (real KITTI or --synthetic)
+train.py                     Training loop (real KITTI or --synthetic; supports --resume_from)
 evaluate.py                  Inference + NMS + mAP evaluation
-demo_geometry.py             Runnable NOW: full non-torch pipeline demo
+demo_geometry.py             Runnable without torch: full non-torch pipeline demo
 ```
 
 ## Status: what's verified vs. what needs torch
@@ -113,6 +142,49 @@ before scaling up. Real training on the full KITTI training set is
 realistically a GPU job (local CUDA GPU or Colab), not something to run
 end-to-end on a laptop CPU.
 
+## Two more bugs found once real GPU training actually ran (2026-09-23)
+
+1. **`PillarFeatureNet.pillarize` used a Python for-loop with `.item()`
+   calls per point.** Harmless on a few thousand synthetic points, but
+   real KITTI scans have ~100,000-120,000 points per scene, and each
+   `.item()` call forces a GPU<->CPU sync -- with ~240,000 such calls per
+   scene, this would have made real-data training impractically slow
+   regardless of GPU compute. Rewrote fully vectorized (stable-sort +
+   cumulative-group-offset trick to assign each point a slot within its
+   pillar, then vectorized scatter/reduction for the centroid and
+   pillar-center offset features). Verified byte-for-byte identical
+   output against the original loop logic on random test data before
+   this was ever run on real hardware.
+
+2. **NMS blew up at low confidence thresholds.** `evaluate.py`'s
+   non-max-suppression compares every surviving candidate box against
+   every other pairwise, using the same pure-Python polygon-clip IoU as
+   elsewhere in this repo. At a normal confidence threshold this stayed
+   small, but a diagnostic run at a much lower threshold (`--score_threshold
+   0.02`, used to check whether the model had "quiet" signal below the
+   normal bar) let thousands of candidates through per scene, turning a
+   should-be-quick eval into a multi-hour hang. Fixed with a standard
+   `max_pre_nms` cap -- keep only the top-scoring N candidates (default
+   300) before running the expensive pairwise step, exactly like real
+   detectors do.
+
+Also added checkpoint resume support (`--resume_from`, `--start_epoch`) to
+`train.py` once real training moved to a paid cloud GPU, so a multi-hour
+run could be extended across sessions rather than restarted from scratch
+every time. Checkpoints now save optimizer state alongside model weights;
+old-format checkpoints (raw state_dict, no optimizer state) still load
+fine, just restart the optimizer's momentum/adaptive-LR history.
+
+## The infrastructure path, briefly
+
+CPU (Mac) for pipeline development and the synthetic-data sanity checks
+-> Google Colab (free T4 GPU) for a first real-data attempt, which is
+where the pillar-resolution/anchor-count bug above became a hard blocker
+-> AWS EC2 `g4dn.xlarge` (paid T4 GPU, ~$0.53/hr on-demand) for the actual
+multi-hour training runs, using `tmux` so training survives dropped SSH
+connections. Total real-data training so far: 80 epochs on 850 scenes,
+~7.5 min/epoch, ~$5-6 of compute.
+
 ## Running it
 
 ```bash
@@ -120,15 +192,21 @@ end-to-end on a laptop CPU.
 pip install numpy scipy matplotlib scikit-learn
 python demo_geometry.py
 
-# Once you have torch + a GPU (local or Colab):
+# Sanity-check training on synthetic data (any machine with torch):
 pip install torch
-python train.py --synthetic --epochs 20        # sanity-check training on synthetic data
+python train.py --synthetic --epochs 20
 python evaluate.py --checkpoint checkpoint_epoch20.pt --synthetic
 
 # On real KITTI, after downloading velodyne/, label_2/, calib/ from
-# https://www.cvlibs.net/datasets/kitti/eval_object.php?obj_benchmark=3d :
-python train.py --root_dir /path/to/kitti --split_file train.txt --epochs 40
-python evaluate.py --checkpoint checkpoint_epoch40.pt --root_dir /path/to/kitti --split_file val.txt
+# https://www.cvlibs.net/datasets/kitti/eval_object.php?obj_benchmark=3d
+# (realistically a GPU job -- see throughput note above):
+python train.py --root_dir /path/to/kitti --split_file train.txt --epochs 80
+python evaluate.py --checkpoint checkpoint_epoch80.pt --root_dir /path/to/kitti --split_file val.txt \
+    --score_threshold 0.02 --iou_threshold 0.1   # loose thresholds show early-training signal
+
+# Resume a long run across sessions instead of restarting from scratch:
+python train.py --root_dir /path/to/kitti --split_file train.txt \
+    --resume_from checkpoint_epoch80.pt --start_epoch 80 --epochs 60
 ```
 
 ## Design notes worth knowing for an interview
