@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+checkpoint_epoch*.pt
+*.png
+.DS_Store
