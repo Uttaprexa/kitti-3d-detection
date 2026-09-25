@@ -12,22 +12,28 @@ Trained on a 1000-scene subset of the real KITTI training set (850 train /
 training across sessions via a checkpoint format that saves optimizer state
 alongside model weights.
 
-| Metric | Epoch 20 | Epoch 80 | Change |
+| Metric | Epoch 20 | Epoch 80 | Epoch 140 (final) |
 |---|---|---|---|
-| Regression loss (box-fitting error) | 0.242 | 0.061 | -75% |
-| Near-field AP, 0-30m (loose IoU>=0.1) | 0.023 | **0.266** | ~11x |
-| Mid-range AP, 30-50m (loose IoU>=0.1) | 0.015 | 0.053 | ~3.5x |
-| Far-field AP, 50m+ (loose IoU>=0.1) | 0.003 | 0.009 | ~3x |
+| Regression loss (box-fitting error) | 0.242 | 0.061 | **0.034** |
+| Near-field AP, 0-30m (loose IoU>=0.1) | 0.023 | 0.266 | **0.359** |
+| Mid-range AP, 30-50m (loose IoU>=0.1) | 0.015 | 0.053 | **0.094** |
+| Far-field AP, 50m+ (loose IoU>=0.1) | 0.003 | 0.009 | **0.009** |
+
+Near-field detection improved ~15.6x and mid-range ~6.3x from epoch 20 to
+140, with box-regression loss dropping 86% overall. Far-field AP plateaued
+between epoch 80 and 140 (0.009 -> 0.009) -- consistent with LiDAR point
+density falling off sharply with distance (fewer laser returns hit distant
+objects), so far-field objects have fundamentally less signal to learn
+from at this scene count, regardless of additional epochs on the same data.
 
 At the standard strict benchmark bar (score>=0.3 confidence, 3D IoU>=0.5),
-AP is still ~0 at epoch 80 -- the model has learned real signal (it's
-finding roughly the right locations, especially for near-field objects
-where LiDAR point density is highest) but isn't yet precise/confident
-enough to clear KITTI's actual pass/fail threshold. `reg_loss` was still
-dropping steadily with no plateau at epoch 80, so this reads as an
-undertrained-but-improving model rather than a broken one -- consistent
-with training a small model on 850 scenes (vs. KITTI's full ~7481-scene
-training set) for a comparatively small number of epochs.
+3 predictions cleared the bar at epoch 140 (up from 0 at epoch 80) --
+still far from reliable detection by that standard, but the first sign of
+any prediction clearing it at all. Training was stopped at epoch 140 given
+visibly diminishing returns (near-field growth slowed from 11x in the
+first 60 additional epochs to 1.4x in the next 60) and a plateaued
+far-field metric -- further improvement would more likely need more
+training scenes than more epochs on the same 850.
 
 Measured training throughput on this setup: **~7.5 minutes/epoch** on 850
 scenes. That rate is dominated by anchor-to-groundtruth matching, which is
@@ -182,8 +188,9 @@ CPU (Mac) for pipeline development and the synthetic-data sanity checks
 where the pillar-resolution/anchor-count bug above became a hard blocker
 -> AWS EC2 `g4dn.xlarge` (paid T4 GPU, ~$0.53/hr on-demand) for the actual
 multi-hour training runs, using `tmux` so training survives dropped SSH
-connections. Total real-data training so far: 80 epochs on 850 scenes,
-~7.5 min/epoch, ~$5-6 of compute.
+connections. Total real-data training: 140 epochs on 850 scenes, in three
+sessions (20 -> 80 -> 140) resumed via checkpoint, ~7.5 min/epoch,
+~$9-10 of total compute.
 
 ## Running it
 
@@ -200,8 +207,8 @@ python evaluate.py --checkpoint checkpoint_epoch20.pt --synthetic
 # On real KITTI, after downloading velodyne/, label_2/, calib/ from
 # https://www.cvlibs.net/datasets/kitti/eval_object.php?obj_benchmark=3d
 # (realistically a GPU job -- see throughput note above):
-python train.py --root_dir /path/to/kitti --split_file train.txt --epochs 80
-python evaluate.py --checkpoint checkpoint_epoch80.pt --root_dir /path/to/kitti --split_file val.txt \
+python train.py --root_dir /path/to/kitti --split_file train.txt --epochs 140
+python evaluate.py --checkpoint checkpoint_epoch140.pt --root_dir /path/to/kitti --split_file val.txt \
     --score_threshold 0.02 --iou_threshold 0.1   # loose thresholds show early-training signal
 
 # Resume a long run across sessions instead of restarting from scratch:
